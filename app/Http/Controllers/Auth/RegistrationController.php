@@ -14,19 +14,18 @@ use Illuminate\Support\Facades\Auth;
 /**
  * app/Http/Controllers/Auth/RegistrationController.php
  * 
- * Handles user registration for all roles in Music Lab:
- * - Student
- * - Instructor
- * - Sales Staff
- * - All-Around Staff
+ * SESSION-BASED REGISTRATION FLOW
+ * ================================
+ * All registration data is stored in encrypted Laravel session
+ * Database insertion only happens AFTER password creation
+ * This prevents "user already exists" issues during multi-step registration
  * 
- * Each role has its own form and validation rules.
- * All registrations follow the same secure pattern:
- * 1. Validate input (except password)
- * 2. Create user_account record without password
- * 3. Create role-specific record
- * 4. Use database transactions for data integrity
- * 5. Redirect to create-account page to set password
+ * Flow:
+ * 1. User fills multi-step form (data stored in session only)
+ * 2. Email uniqueness validated before storing in session
+ * 3. User redirected to password creation page
+ * 4. After password entry, ALL data saved to DB in one transaction
+ * 5. User auto-logged in and redirected to dashboard
  */
 class RegistrationController extends Controller
 {
@@ -36,52 +35,32 @@ class RegistrationController extends Controller
 
     /**
      * Display the student registration form
-     * 
-     * Loads all active instruments for the dropdown selection
-     * 
-     * @return \Illuminate\View\View
      */
     public function showStudentRegistrationForm()
     {
-        // Fetch only active instruments, ordered alphabetically
         $instruments = DB::table('instrument')
             ->where('is_active', true)
             ->orderBy('instrument_name')
             ->get();
 
-        // Pass instruments to the view
         return view('auth.register.student', compact('instruments'));
     }
 
     /**
-     * Process student registration submission
-     * 
-     * Validates data, creates user account and student profile without password
-     * Uses transaction to ensure both records are created successfully
-     * Redirects to create-account with email and role
-     * 
-     * @param  \Illuminate\Http\Request  $request
-     * @return \Illuminate\Http\RedirectResponse
+     * Process student registration - STORES IN SESSION ONLY
      */
     public function registerStudent(Request $request)
     {
-        // Validate incoming form data (no password required here)
+        // Validate ALL data including email uniqueness
         $validated = $request->validate([
-            // Account Information
             'user_email' => 'required|email|unique:user_account,user_email',
-            
-            // Personal Information (Required)
             'first_name' => 'required|string|max:100',
             'last_name' => 'required|string|max:100',
             'phone' => 'required|regex:/^[0-9]{11}$/',
-            
-            // Personal Information (Optional)
             'middle_name' => 'nullable|string|max:100',
             'suffix' => 'nullable|string|max:20',
             'date_of_birth' => 'nullable|date',
             'gender' => 'nullable|in:Male,Female,Other,Prefer not to say',
-            
-            // Musical Information (Optional)
             'instrument_id' => 'nullable|exists:instrument,instrument_id',
             'skill_level' => 'nullable|in:beginner,intermediate,advanced,expert',
             'music_goals' => 'nullable|string',
@@ -90,71 +69,23 @@ class RegistrationController extends Controller
             'phone.regex' => 'Phone number must be exactly 11 digits.',
         ]);
 
-        DB::beginTransaction();
+        //STORE IN SESSION - NOT DATABASE YET
+        session([
+            'registration_data' => $validated,
+            'registration_role' => 'student'
+        ]);
 
-        try {
-            // Step 1: Create the main user account without password
-            $user = UserAccount::create([
-                'user_email' => $validated['user_email'],
-                'user_password' => null, // Will be set later
-                'is_super_admin' => false,
-            ]);
-
-            // Step 2: Get the "Active" status ID for new students
-            $activeStatusId = DB::table('student_status')
-                ->where('status_name', 'Active')
-                ->value('status_id');
-
-            if (!$activeStatusId) {
-                throw new \Exception('Active student status not found in database.');
-            }
-
-            // Step 3: Create the student profile linked to the user
-            DB::table('student')->insert([
-                'user_id' => $user->user_id,
-                'first_name' => $validated['first_name'],
-                'middle_name' => $validated['middle_name'] ?? null,
-                'last_name' => $validated['last_name'],
-                'suffix' => $validated['suffix'] ?? null,
-                'phone' => $validated['phone'],
-                'email' => $validated['user_email'],
-                'date_of_birth' => $validated['date_of_birth'] ?? null,
-                'gender' => $validated['gender'] ?? null,
-                'instrument_id' => $validated['instrument_id'] ?? null,
-                'skill_level' => $validated['skill_level'] ?? null,
-                'music_goals' => $validated['music_goals'] ?? null,
-                'student_status_id' => $activeStatusId,
-                'enrollment_date' => now()->format('Y-m-d'),
-                'country' => 'Philippines',
-                'is_active' => true,
-                'created_at' => now(),
-                'updated_at' => now(),
-            ]);
-
-            DB::commit();
-
-            // Redirect to password setup page
-            return redirect()->route('account.create')
-                ->with('email', $validated['user_email'])
-                ->with('role', 'student');
-
-        } catch (\Exception $e) {
-            DB::rollBack();
-            \Log::error('Student registration failed: ' . $e->getMessage());
-
-            return back()->withInput()
-                ->withErrors(['error' => 'Registration failed. Please try again.']);
-        }
+        // Redirect to password creation page
+        return redirect()->route('account.create')
+            ->with('success', 'Please create your password to complete registration.');
     }
 
     // ============================================================================
-    // INSTRUCTOR REGISTRATION
+    // INSTRUCTOR REGISTRATION - SESSION-BASED
     // ============================================================================
 
     /**
      * Display the instructor registration form
-     * 
-     * Loads all active specializations for selection
      */
     public function showInstructorRegistrationForm()
     {
@@ -167,14 +98,14 @@ class RegistrationController extends Controller
     }
 
     /**
-     * Process instructor registration submission
-     * 
-     * Validates specializations and primary selection carefully
+     * Process instructor registration - STORES IN SESSION ONLY
+     * NO DATABASE INSERTION UNTIL PASSWORD CREATION
      */
     public function registerInstructor(Request $request)
     {
+        // Validate ALL data including email uniqueness
         $validated = $request->validate([
-            // Account
+            // Account - Email uniqueness check BEFORE storing
             'user_email' => 'required|email|unique:user_account,user_email',
             
             // Personal Info
@@ -215,97 +146,26 @@ class RegistrationController extends Controller
             'specializations.*' => 'exists:specialization,specialization_id',
             'primary_specialization' => ['required', Rule::in($request->input('specializations', []))],
         ], [
+            'user_email.unique' => 'This email is already registered. Please use a different email or login.',
+            'phone.regex' => 'Phone number must be exactly 11 digits.',
+            'emergency_contact_phone.regex' => 'Emergency contact phone must be exactly 11 digits.',
             'specializations.required' => 'Please select at least one specialization.',
             'primary_specialization.in' => 'Primary specialization must be one of your selected specializations.',
         ]);
 
-        DB::beginTransaction();
+        // STORE ALL DATA IN SESSION - NOT DATABASE YET
+        session([
+            'registration_data' => $validated,
+            'registration_role' => 'instructor'
+        ]);
 
-        try {
-            // Create user account
-            $user = UserAccount::create([
-                'user_email' => $validated['user_email'],
-                'user_password' => null,
-                'is_super_admin' => false,
-            ]);
-
-            // Insert instructor and get the instructor_id (not "id")
-            DB::table('instructor')->insert([
-                'user_id' => $user->user_id,
-                'first_name' => $validated['first_name'],
-                'middle_name' => $validated['middle_name'] ?? null,
-                'last_name' => $validated['last_name'],
-                'suffix' => $validated['suffix'] ?? null,
-                'phone' => $validated['phone'],
-                'email' => $validated['user_email'],
-                'date_of_birth' => $validated['date_of_birth'],
-                'gender' => $validated['gender'],
-                'nationality' => $validated['nationality'] ?? null,
-                
-                // Address fields
-                'address_line1' => $validated['address_line1'],
-                'address_line2' => $validated['address_line2'] ?? null,
-                'city' => $validated['city'],
-                'province' => $validated['province'],
-                'postal_code' => $validated['postal_code'],
-                'country' => $validated['country'],
-                
-                // Emergency contact
-                'emergency_contact_name' => $validated['emergency_contact_name'],
-                'emergency_contact_relationship' => $validated['emergency_contact_relationship'],
-                'emergency_contact_phone' => $validated['emergency_contact_phone'],
-                
-                // Professional
-                'years_of_experience' => $validated['years_of_experience'],
-                'education_level' => $validated['education_level'],
-                'music_degree' => $validated['music_degree'] ?? null,
-                'languages_spoken' => $validated['languages_spoken'] ?? null,
-                'teaching_style' => $validated['teaching_style'] ?? null,
-                'bio' => $validated['bio'] ?? null,
-                
-                'hire_date' => now(),
-                'employment_status' => 'active',
-                'is_available' => true,
-                'is_active' => true,
-                'created_at' => now(),
-                'updated_at' => now(),
-            ]);
-
-            // Get the instructor_id we just created
-            $instructorId = DB::table('instructor')
-                ->where('user_id', $user->user_id)
-                ->value('instructor_id');
-
-            // Insert specializations
-            foreach ($validated['specializations'] as $specializationId) {
-                DB::table('instructor_specialization')->insert([
-                    'instructor_id' => $instructorId,
-                    'specialization_id' => $specializationId,
-                    'is_primary' => ($specializationId == $validated['primary_specialization']),
-                    'created_at' => now(),
-                    'updated_at' => now(),
-                ]);
-            }
-
-            DB::commit();
-
-            // Redirect to password creation page
-            return redirect()->route('account.create')
-                ->with('email', $validated['user_email'])
-                ->with('role', 'instructor')
-                ->with('success', 'Registration successful! Please create your password.');
-
-        } catch (\Exception $e) {
-            DB::rollBack();
-            \Log::error('Instructor registration failed: ' . $e->getMessage());
-
-            return back()->withInput()
-                ->withErrors(['error' => 'Registration failed: ' . $e->getMessage()]);
-        }
+        // Redirect to password creation page
+        return redirect()->route('account.create')
+            ->with('success', 'Please create your password to complete registration.');
     }
 
     // ============================================================================
-    // SALES STAFF REGISTRATION
+    // SALES STAFF REGISTRATION - SESSION-BASED
     // ============================================================================
 
     public function showSalesStaffRegistrationForm()
@@ -323,51 +183,23 @@ class RegistrationController extends Controller
             'middle_name' => 'nullable|string|max:100',
             'date_of_birth' => 'nullable|date',
             'gender' => 'nullable|in:Male,Female,Other,Prefer not to say',
+        ], [
+            'user_email.unique' => 'This email is already registered.',
+            'phone.regex' => 'Phone number must be exactly 11 digits.',
         ]);
 
-        DB::beginTransaction();
+        //STORE IN SESSION
+        session([
+            'registration_data' => $validated,
+            'registration_role' => 'sales_staff'
+        ]);
 
-        try {
-            $user = UserAccount::create([
-                'user_email' => $validated['user_email'],
-                'user_password' => null,
-                'is_super_admin' => false,
-            ]);
-
-            DB::table('sales_staff')->insert([
-                'user_id' => $user->user_id,
-                'first_name' => $validated['first_name'],
-                'middle_name' => $validated['middle_name'] ?? null,
-                'last_name' => $validated['last_name'],
-                'phone' => $validated['phone'],
-                'email' => $validated['user_email'],
-                'date_of_birth' => $validated['date_of_birth'] ?? null,
-                'gender' => $validated['gender'] ?? null,
-                'hire_date' => now(),
-                'employment_status' => 'active',
-                'country' => 'Philippines',
-                'is_active' => true,
-                'created_at' => now(),
-                'updated_at' => now(),
-            ]);
-
-            DB::commit();
-
-            return redirect()->route('account.create')
-                ->with('email', $validated['user_email'])
-                ->with('role', 'sales_staff');
-
-        } catch (\Exception $e) {
-            DB::rollBack();
-            \Log::error('Sales staff registration failed: ' . $e->getMessage());
-
-            return back()->withInput()
-                ->withErrors(['error' => 'Registration failed. Please try again.']);
-        }
+        return redirect()->route('account.create')
+            ->with('success', 'Please create your password to complete registration.');
     }
 
     // ============================================================================
-    // ALL-AROUND STAFF REGISTRATION
+    // ALL-AROUND STAFF REGISTRATION - SESSION-BASED
     // ============================================================================
 
     public function showStaffRegistrationForm()
@@ -385,125 +217,297 @@ class RegistrationController extends Controller
             'middle_name' => 'nullable|string|max:100',
             'date_of_birth' => 'nullable|date',
             'gender' => 'nullable|in:Male,Female,Other,Prefer not to say',
+        ], [
+            'user_email.unique' => 'This email is already registered.',
+            'phone.regex' => 'Phone number must be exactly 11 digits.',
         ]);
 
-        DB::beginTransaction();
+        //STORE IN SESSION
+        session([
+            'registration_data' => $validated,
+            'registration_role' => 'all_around_staff'
+        ]);
 
-        try {
-            $user = UserAccount::create([
-                'user_email' => $validated['user_email'],
-                'user_password' => null,
-                'is_super_admin' => false,
-            ]);
-
-            DB::table('all_around_staff')->insert([
-                'user_id' => $user->user_id,
-                'first_name' => $validated['first_name'],
-                'middle_name' => $validated['middle_name'] ?? null,
-                'last_name' => $validated['last_name'],
-                'phone' => $validated['phone'],
-                'email' => $validated['user_email'],
-                'date_of_birth' => $validated['date_of_birth'] ?? null,
-                'gender' => $validated['gender'] ?? null,
-                'hire_date' => now(),
-                'employment_status' => 'active',
-                'country' => 'Philippines',
-                'is_active' => true,
-                'created_at' => now(),
-                'updated_at' => now(),
-            ]);
-
-            DB::commit();
-
-            return redirect()->route('account.create')
-                ->with('email', $validated['user_email'])
-                ->with('role', 'all_around_staff');
-
-        } catch (\Exception $e) {
-            DB::rollBack();
-            \Log::error('All-around staff registration failed: ' . $e->getMessage());
-
-            return back()->withInput()
-                ->withErrors(['error' => 'Registration failed. Please try again.']);
-        }
+        return redirect()->route('account.create')
+            ->with('success', 'Please create your password to complete registration.');
     }
 
     // ============================================================================
-    // PASSWORD SETUP (CREATE ACCOUNT)
+    // PASSWORD SETUP (CREATE ACCOUNT) - THIS IS WHERE DATABASE INSERTION HAPPENS
     // ============================================================================
 
     /**
      * Show the create account (password setup) form
-     * 
-     * @return \Illuminate\View\View
+     * Retrieves registration data from session
      */
     public function showCreateAccountForm()
     {
-        $email = session('email');
-        $role = session('role', 'student'); // Get role from session
+        // Get registration data from session
+        $registrationData = session('registration_data');
+        $role = session('registration_role');
         
-        if (!$email) {
+        // Validate session data exists
+        if (!$registrationData || !$role) {
             return redirect()->route('register')
-                ->withErrors(['error' => 'Invalid session. Please start registration again.']);
+                ->withErrors(['error' => 'Registration session expired. Please start registration again.']);
         }
 
-        // Verify the user exists and hasn't set password yet
-        $user = UserAccount::where('user_email', $email)->first();
-        
-        if (!$user) {
+        $email = $registrationData['user_email'];
+
+        // Double-check email is still available (in case session was old)
+        $existingUser = UserAccount::where('user_email', $email)->first();
+        if ($existingUser) {
+            // Clear invalid session
+            session()->forget(['registration_data', 'registration_role']);
+            
             return redirect()->route('register')
-                ->withErrors(['error' => 'Account not found. Please register again.']);
-        }
-        
-        if ($user->user_password !== null) {
-            return redirect()->route('login')
-                ->with('info', 'Account already activated. Please login.');
+                ->withErrors(['error' => 'This email is already registered. Please login or use a different email.']);
         }
 
         return view('auth.create-account', compact('email', 'role'));
     }
 
     /**
-     * Process password setup
-     * 
-     * Validates password, updates user, logs in, redirects to dashboard
-     * 
-     * @param  \Illuminate\Http\Request  $request
-     * @return \Illuminate\Http\RedirectResponse
+     * Process password setup and CREATE ALL DATABASE RECORDS
+     * THIS IS WHERE EVERYTHING GETS SAVED TO DATABASE
      */
     public function processCreateAccount(Request $request)
     {
-        $validated = $request->validate([
-            'user_email' => 'required|email|exists:user_account,user_email',
+        // Validate password
+        $passwordValidated = $request->validate([
             'user_password' => ['required', 'confirmed', Password::min(8)],
-            'role' => 'required|in:student,instructor,sales_staff,all_around_staff',
         ]);
 
-        $user = UserAccount::where('user_email', $validated['user_email'])->firstOrFail();
+        // Get registration data from session
+        $registrationData = session('registration_data');
+        $role = session('registration_role');
 
-        // Prevent setting password if already set
-        if ($user->user_password !== null) {
-            return redirect()->route('login')
-                ->withErrors(['error' => 'Account already activated. Please login.']);
+        // Validate session still exists
+        if (!$registrationData || !$role) {
+            return redirect()->route('register')
+                ->withErrors(['error' => 'Registration session expired. Please start again.']);
         }
 
-        // Set password (will be hashed by mutator in UserAccount model)
-        $user->user_password = $validated['user_password'];
-        $user->save();
+        // Extract email from session data
+        $email = $registrationData['user_email'];
 
-        // Log the user in immediately
-        Auth::login($user);
+        // Final email uniqueness check before insertion
+        if (UserAccount::where('user_email', $email)->exists()) {
+            session()->forget(['registration_data', 'registration_role']);
+            return redirect()->route('register')
+                ->withErrors(['error' => 'This email was just registered by someone else. Please use a different email.']);
+        }
 
-        // Redirect based on role
-        $dashboardRoute = match ($validated['role']) {
-            'student' => 'student.dashboard',
-            'instructor' => 'instructor.dashboard',
-            'sales_staff' => 'sales.dashboard',
-            'all_around_staff' => 'staff.dashboard',
-            default => 'home',
-        };
+        // ============================================================================
+        // BEGIN TRANSACTION - SAVE EVERYTHING TO DATABASE
+        // ============================================================================
+        DB::beginTransaction();
 
-        return redirect()->route($dashboardRoute)
-            ->with('success', 'Welcome! Your account has been activated successfully.');
+        try {
+            // Step 1: Create user_account with password
+            $user = UserAccount::create([
+                'user_email' => $email,
+                'user_password' => $passwordValidated['user_password'], // Will be hashed by mutator
+                'is_super_admin' => false,
+            ]);
+
+            // Step 2: Create role-specific record based on registration type
+            switch ($role) {
+                case 'student':
+                    $this->createStudentRecord($user->user_id, $registrationData);
+                    $dashboardRoute = 'student.dashboard';
+                    break;
+
+                case 'instructor':
+                    $this->createInstructorRecord($user->user_id, $registrationData);
+                    $dashboardRoute = 'instructor.dashboard';
+                    break;
+
+                case 'sales_staff':
+                    $this->createSalesStaffRecord($user->user_id, $registrationData);
+                    $dashboardRoute = 'sales.dashboard';
+                    break;
+
+                case 'all_around_staff':
+                    $this->createAllAroundStaffRecord($user->user_id, $registrationData);
+                    $dashboardRoute = 'staff.dashboard';
+                    break;
+
+                default:
+                    throw new \Exception('Invalid role type');
+            }
+            DB::commit();
+
+            // Clear registration session data
+            session()->forget(['registration_data', 'registration_role']);
+
+            // Auto-login the user
+            Auth::login($user);
+
+            // Redirect to appropriate dashboard
+            return redirect()->route($dashboardRoute)
+                ->with('success', 'Welcome! Your account has been created successfully.');
+
+        } catch (\Exception $e) {
+            DB::rollBack();
+            \Log::error('Account creation failed: ' . $e->getMessage());
+
+            return back()
+                ->withErrors(['error' => 'Account creation failed: ' . $e->getMessage()])
+                ->withInput();
+        }
+    }
+
+    // ============================================================================
+    // HELPER METHODS - CREATE ROLE-SPECIFIC RECORDS
+    // ============================================================================
+
+    /**
+     * Create student record in database
+     */
+    private function createStudentRecord($userId, $data)
+    {
+        $activeStatusId = DB::table('student_status')
+            ->where('status_name', 'Active')
+            ->value('status_id');
+
+        if (!$activeStatusId) {
+            throw new \Exception('Active student status not found in database.');
+        }
+
+        DB::table('student')->insert([
+            'user_id' => $userId,
+            'first_name' => $data['first_name'],
+            'middle_name' => $data['middle_name'] ?? null,
+            'last_name' => $data['last_name'],
+            'suffix' => $data['suffix'] ?? null,
+            'phone' => $data['phone'],
+            'email' => $data['user_email'],
+            'date_of_birth' => $data['date_of_birth'] ?? null,
+            'gender' => $data['gender'] ?? null,
+            'instrument_id' => $data['instrument_id'] ?? null,
+            'skill_level' => $data['skill_level'] ?? null,
+            'music_goals' => $data['music_goals'] ?? null,
+            'student_status_id' => $activeStatusId,
+            'enrollment_date' => now()->format('Y-m-d'),
+            'country' => 'Philippines',
+            'is_active' => true,
+            'created_at' => now(),
+            'updated_at' => now(),
+        ]);
+    }
+
+    /**
+     * Create instructor record with specializations in database
+     */
+    private function createInstructorRecord($userId, $data)
+    {
+        // Insert instructor record
+        DB::table('instructor')->insert([
+            'user_id' => $userId,
+            'first_name' => $data['first_name'],
+            'middle_name' => $data['middle_name'] ?? null,
+            'last_name' => $data['last_name'],
+            'suffix' => $data['suffix'] ?? null,
+            'phone' => $data['phone'],
+            'email' => $data['user_email'],
+            'date_of_birth' => $data['date_of_birth'],
+            'gender' => $data['gender'],
+            'nationality' => $data['nationality'] ?? null,
+            
+            // Address
+            'address_line1' => $data['address_line1'],
+            'address_line2' => $data['address_line2'] ?? null,
+            'city' => $data['city'],
+            'province' => $data['province'],
+            'postal_code' => $data['postal_code'],
+            'country' => $data['country'],
+            
+            // Emergency contact
+            'emergency_contact_name' => $data['emergency_contact_name'],
+            'emergency_contact_relationship' => $data['emergency_contact_relationship'],
+            'emergency_contact_phone' => $data['emergency_contact_phone'],
+            
+            // Professional
+            'years_of_experience' => $data['years_of_experience'],
+            'education_level' => $data['education_level'],
+            'music_degree' => $data['music_degree'] ?? null,
+            'languages_spoken' => $data['languages_spoken'] ?? null,
+            'teaching_style' => $data['teaching_style'] ?? null,
+            'bio' => $data['bio'] ?? null,
+            
+            'hire_date' => now(),
+            'employment_status' => 'active',
+            'is_available' => true,
+            'is_active' => true,
+            'created_at' => now(),
+            'updated_at' => now(),
+        ]);
+
+        // Get the instructor_id we just created
+        $instructorId = DB::table('instructor')
+            ->where('user_id', $userId)
+            ->value('instructor_id');
+
+        if (!$instructorId) {
+            throw new \Exception('Failed to retrieve instructor_id after creation.');
+        }
+
+        // Insert specializations
+        foreach ($data['specializations'] as $specializationId) {
+            DB::table('instructor_specialization')->insert([
+                'instructor_id' => $instructorId,
+                'specialization_id' => $specializationId,
+                'is_primary' => ($specializationId == $data['primary_specialization']),
+                'created_at' => now(),
+                'updated_at' => now(),
+            ]);
+        }
+    }
+
+    /**
+     * Create sales staff record in database
+     */
+    private function createSalesStaffRecord($userId, $data)
+    {
+        DB::table('sales_staff')->insert([
+            'user_id' => $userId,
+            'first_name' => $data['first_name'],
+            'middle_name' => $data['middle_name'] ?? null,
+            'last_name' => $data['last_name'],
+            'phone' => $data['phone'],
+            'email' => $data['user_email'],
+            'date_of_birth' => $data['date_of_birth'] ?? null,
+            'gender' => $data['gender'] ?? null,
+            'hire_date' => now(),
+            'employment_status' => 'active',
+            'country' => 'Philippines',
+            'is_active' => true,
+            'created_at' => now(),
+            'updated_at' => now(),
+        ]);
+    }
+
+    /**
+     * Create all-around staff record in database
+     */
+    private function createAllAroundStaffRecord($userId, $data)
+    {
+        DB::table('all_around_staff')->insert([
+            'user_id' => $userId,
+            'first_name' => $data['first_name'],
+            'middle_name' => $data['middle_name'] ?? null,
+            'last_name' => $data['last_name'],
+            'phone' => $data['phone'],
+            'email' => $data['user_email'],
+            'date_of_birth' => $data['date_of_birth'] ?? null,
+            'gender' => $data['gender'] ?? null,
+            'hire_date' => now(),
+            'employment_status' => 'active',
+            'country' => 'Philippines',
+            'is_active' => true,
+            'created_at' => now(),
+            'updated_at' => now(),
+        ]);
     }
 }
